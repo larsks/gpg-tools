@@ -1,0 +1,19 @@
+#!/bin/sh
+
+# Remove the secret components of the master key (leaving secret subkeys
+# intact), as per <http://wiki.debian.org/subkeys>.
+
+workdir=$(mktemp -d gpgXXXXXX)
+trap "rm -rf $workdir" EXIT
+
+gpg --list-key --with-fingerprint --with-colons "$1" >$workdir/list
+
+key_fpr=$(awk -F: '$1 == "fpr" {print $10}' $workdir/list)
+
+gpg --export-secret-subkeys $(awk -F: '$1 == "sub" {print $5}' $workdir/list) >$workdir/subkeys
+gpg --export $key_fpr >$workdir/pubkey
+gpg --delete-secret-key --batch --yes $key_fpr
+gpg --import $workdir/pubkey $workdir/subkeys
+
+gpg -K $key_fpr
+

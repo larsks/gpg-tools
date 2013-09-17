@@ -1,0 +1,233 @@
+#!/bin/bash
+
+# GPG is hard.
+#
+# Best practice suggests that you should generate separate signing subkeys for
+# regular use while protecting your primary key for exceptional purposes, such
+# as key signing.  Creating the necessary subkeys can involve a lot of typing.
+#
+# Other tools, such as [monkeysphere][], want an authentication subkey.  Generating
+# this yourself requires the `--expert` option to `--edit-key` and presents other 
+# opportunities for making mistake.
+#
+# This script generates a new GPG primary and seperate subkeys for encryption,
+# signing, and authentication. The authentication subkey can be used with
+# [monkeysphere][] for ssh authentication.
+#
+# You can set key length and expiration options globally, only for subkeys, or
+# per-subkey.
+#
+# [monkeysphere]: http://monkeysphere.info/
+#
+# License
+# =======
+#
+#   newkey -- batch generate a GnuPG key and subkeys
+#   Copyright (C) 2013 Lars Kellogg-Stedman <lars@oddbit.com>
+#
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, either version 3 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+: ${GPG:=gpg}
+: ${GPG_AGENT:=gpg-agent}
+
+myname=$(basename $0)
+
+if getopt --long > /dev/null 2>&1 ; then
+	echo "[$myname] ERROR: This script requires the GNU version of getopt" >&2
+	exit 1
+fi
+
+gpg_generate_auth_subkey=yes
+gpg_generate_sign_subkey=yes
+gpg_generate_encrypt_subkey=yes
+
+gpg_common_args="--no-greeting --quiet"
+
+OPTS=$(getopt -n $myname \
+-l keylen:,subkey-keylen:,encrypt-keylen:,sign-keylen:,auth-keylen:,\
+no-auth,no-sign,no-encryption,no-password,\
+expires:,subkey-expires:,sign-expires:,auth-expires:,quick,home: \
+-- "k:Ax:qh:" "$@")
+
+[ $? -eq 0 ] || exit 1
+
+eval set -- "$OPTS"
+
+while :; do
+	case $1 in
+	# Use insecure random number generation (GPG 2.0 and later)
+	--quick|-q)
+		if ! $GPG --version | head -1 | grep -q 'gpg (GnuPG) 2\.'; then
+			echo "[$myname] ERROR: The --quick option only works GPG version 2.0 or later." >&2
+			exit 1
+		fi
+		gpg_common_args="${gpg_common_args} --debug-quick-random"
+		shift;;
+	# Set primary key length (for primary key and default for all subkeys).
+	--keylen|-k)
+		gpg_primary_keylen="$2"
+		shift 2;;
+	# Set default key length for all subkeys
+	--subkey-keylen)
+		gpg_subkey_keylen="$2"
+		shift 2;;
+	# Set key length for encryption subkey.
+	--encrypt-keylen)
+		gpg_encrypt_keylen="$2"
+		shift 2;;
+	# Set key length for signing subkey.
+	--sign-keylen)
+		gpg_sign_keylen="$2"
+		shift 2;;
+	# Set key length for authentication subkey.
+	--auth-keylen)
+		gpg_auth_keylen="$2"
+		shift 2;;
+	# Suppress generation of authentication subkey.
+	--no-auth|-A)
+		gpg_generate_auth_subkey=no
+		shift;;
+	# Suppress generation of signing subkey.
+	--no-sign)
+		gpg_generate_sign_subkey=no
+		shift;;
+	# Suppress generation of encryption subkey.
+	--no-encryption)
+		gpg_generate_encrypt_subkey=no
+		shift;;
+	# Set global expiration (for primary key and default for all subkeys).
+	--expires|-x)
+		gpg_primary_expires="$2"
+		shift 2;;
+	# Set default expiration for all subkeys.
+	--subkey-expires)
+		gpg_subkey_expires="$2"
+		shift 2;;
+	--sign-expires)
+		gpg_sign_expires="$2"
+		shift 2;;
+	--auth-expires)
+		gpg_auth_expires="$2"
+		shift 2;;
+	# Generate an unprotected key.
+	--no-password)
+		gpg_unprotected=yes
+		shift;;
+	# Use alternate GnuPG home directory.
+	--home|-h)
+		gpg_home="$2"
+		shift 2;;
+	--) shift; break;;
+	*)
+		echo "[$myname] ERROR: Bad option: $1" >&2
+		exit 1
+		;;
+	esac
+done
+
+: ${gpg_primary_keylen:=2048}
+: ${gpg_subkey_keylen:=$gpg_primary_keylen}
+: ${gpg_encrypt_keylen:=$gpg_subkey_keylen}
+: ${gpg_sign_keylen:=$gpg_subkey_keylen}
+: ${gpg_auth_keylen:=$gpg_subkey_keylen}
+
+: ${gpg_subkey_expires:=$gpg_primary_expires}
+: ${gpg_sign_expires:=$gpg_subkey_expires}
+: ${gpg_auth_expires:=$gpg_subkey_expires}
+
+gpg_uid="$1"
+
+tmpfile=$(mktemp gpgXXXXXX)
+trap "rm -f $tmpfile" EXIT
+
+if [ "$gpg_home" ] && ! [ -d "$gpg_home" ]; then
+	echo "[$myname] Creating GPG directory $gpg_home"
+	install -d -m 700 "$gpg_home"
+fi
+
+echo "[$myname] Generating $gpg_primary_keylen bit primary RSA key"
+$GPG ${gpg_home:+--home="$gpg_home"} $gpg_common_args --batch --status-fd 4 --gen-key 4>$tmpfile <<EOF
+Key-type: RSA
+Key-usage: sign
+Key-length: $gpg_primary_keylen
+Name-real: $gpg_uid
+${gpg_primary_expires:+Expire-date: $gpg_primary_expires}
+EOF
+
+gpg_key_id=$(awk '$2 == "KEY_CREATED" {print $4}' $tmpfile)
+echo "[$myname] Generated key $gpg_key_id +sign +cert"
+
+if [ "$gpg_generate_sign_subkey" != no ]; then
+	echo "[$myname] Generating $gpg_sign_keylen bit RSA signing subkey"
+	$GPG ${gpg_home:+--home="$gpg_home"} $gpg_common_args --no-tty \
+		--command-fd 0 --status-fd 4 --edit-key $gpg_key_id 4>$tmpfile <<-EOF
+	addkey
+	4
+	$gpg_sign_keylen
+	${gpg_sign_expires:-0}
+	save
+	EOF
+fi
+
+if [ "$gpg_generate_encrypt_subkey" != no ]; then
+	echo "[$myname] Generating $gpg_encrypt_keylen bit RSA encryption subkey"
+	$GPG ${gpg_home:+--home="$gpg_home"} $gpg_common_args --no-tty \
+		--command-fd 0 --status-fd 4 --edit-key $gpg_key_id 4>$tmpfile <<-EOF
+	addkey
+	6
+	$gpg_encrypt_keylen
+	${gpg_encrypt_expires:-0}
+	save
+	EOF
+fi
+
+if [ "$gpg_generate_auth_subkey" != no ]; then
+	echo "[$myname] Generating $gpg_auth_keylen bit RSA authentication subkey"
+	$GPG ${gpg_home:+--home="$gpg_home"} $gpg_common_args --no-tty \
+		--command-fd 0 --status-fd 4 --expert --edit-key $gpg_key_id 4>$tmpfile <<-EOF
+	addkey
+	8
+	S
+	E
+	A
+	Q
+	$gpg_auth_keylen
+	${gpg_auth_expires:-0}
+	save
+	EOF
+fi
+
+echo "[$myname] Generating revocation certificate"
+$GPG ${gpg_home:+--home="$gpg_home"} $gpg_common_args \
+	-a --command-fd 0 --output "${gpg_key_id}.revoke" \
+	--gen-revoke "${gpg_key_id}" <<EOF
+y
+0
+
+y
+EOF
+
+if ! [ "$gpg_unprotected" = yes ]; then
+	$GPG_AGENT --daemon $GPG ${gpg_home:+--home="$gpg_home"} $gpg_common_args --status-fd 4 \
+		--edit-key "$gpg_key_id" passwd save 4>$tmpfile
+else
+	cat <<-EOF
+	** WARNING ** You have generated an unprotected key (a key with no password).
+	EOF
+fi
+
+$GPG ${gpg_home:+--home="$gpg_home"} $gpg_common_args --edit "$gpg_key_id" quit
+echo "[$myname] All done for key ${gpg_key_id}"
+

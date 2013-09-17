@@ -1,0 +1,49 @@
+#!/bin/bash
+
+: ${GPG=gpg2}
+
+tmpfile=$(mktemp gpgXXXXXX)
+trap "rm -f $tmpfile" EXIT
+
+GNUPGHOME=$1
+export GNUPGHOME
+
+install -m 700 -d ${GNUPGHOME}
+
+echo "Creating primary key"
+${GPG} --batch --status-fd 1 --gen-key > $tmpfile <<EOF 
+Key-Type: RSA
+Key-Length: 2048
+Key-Usage: sign
+Subkey-Type: RSA
+Subkey-Length: 2048
+Subkey-Usage: encrypt
+Name-Real: $2
+EOF
+
+keyid=$(awk '/KEY_CREATED/ {print $4}' $tmpfile)
+
+echo "Adding signing subkey"
+gpg --batch --command-fd 0 --edit 0x${keyid} > $tmpfile 2>&1 <<EOF
+addkey
+4
+2048
+365
+save
+EOF
+
+echo "Adding auth subkey"
+gpg --batch --command-fd 0 --expert --edit 0x${keyid} > $tmpfile 2>&1 <<EOF
+addkey
+8
+S
+E
+A
+Q
+2048
+365
+save
+EOF
+
+gpg --no-greeting --batch --edit 0x${keyid} quit
+
